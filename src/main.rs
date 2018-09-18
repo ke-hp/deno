@@ -7,6 +7,7 @@ extern crate msg_rs as msg;
 extern crate rand;
 extern crate tempfile;
 extern crate tokio;
+extern crate tokio_executor;
 extern crate url;
 #[macro_use]
 extern crate log;
@@ -25,7 +26,6 @@ mod libdeno;
 mod net;
 mod version;
 
-use isolate::Isolate;
 use std::env;
 
 static LOGGER: Logger = Logger;
@@ -45,36 +45,31 @@ impl log::Log for Logger {
   fn flush(&self) {}
 }
 
+// Set the default executor so we can use tokio::spawn(). It's difficult to
+// pass around mut references to the runtime, so using with_default is
+// preferable. Ideally Tokio would provide this function.
+fn tokio_init<F>(f: F)
+where
+  F: Fn(),
+{
+  let rt = tokio::runtime::Runtime::new().unwrap();
+  let mut executor = rt.executor();
+  let mut enter = tokio_executor::enter().expect("Multiple executors at once");
+  tokio_executor::with_default(&mut executor, &mut enter, move |_enter| f());
+}
+
 fn main() {
   log::set_logger(&LOGGER).unwrap();
-
-  let js_args = flags::v8_set_flags(env::args().collect());
-
-  let mut isolate = Isolate::new(js_args);
-
-  if isolate.flags.help {
-    flags::print_usage();
-    std::process::exit(0);
-  }
-
-  if isolate.flags.version {
-    version::print_version();
-    std::process::exit(0);
-  }
-
-  let mut log_level = log::LevelFilter::Info;
-  if isolate.flags.log_debug {
-    log_level = log::LevelFilter::Debug;
-  }
-  log::set_max_level(log_level);
-
-  isolate
-    .execute("deno_main.js", "denoMain();")
-    .unwrap_or_else(|err| {
-      error!("{}", err);
-      std::process::exit(1);
-    });
-
-  // Start the Tokio event loop
-  isolate.rt.run().expect("err");
+  let args = env::args().collect();
+  let isolate = isolate::Isolate::new(args, handlers::msg_from_js);
+  flags::process(&isolate.state.flags);
+  tokio_init(|| {
+    isolate
+      .execute("deno_main.js", "denoMain();")
+      .unwrap_or_else(|err| {
+        error!("{}", err);
+        std::process::exit(1);
+      });
+    isolate.event_loop();
+  });
 }
